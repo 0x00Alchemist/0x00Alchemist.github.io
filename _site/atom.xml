@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+ <title>alchemist.</title>
+ <link href="http://localhost:4000/atom.xml" rel="self"/>
+ <link href="http://localhost:4000/"/>
+ <updated>2023-06-16T18:24:34+02:00</updated>
+ <id>http://localhost:4000</id>
+ <author>
+   <name>alchemist</name>
+   <email>cerebralagony@email.com</email>
+ </author>
+
+ 
+ <entry>
+   <title>Drowning In The Kernel - Driver Signature Enforcement!</title>
+   <link href="http://localhost:4000/2022/11/18/driver-signature-enforcement-%D0%B8%D0%BB%D0%B8-%D0%B8%D1%81%D1%81%D0%BB%D0%B5%D0%B4%D1%83%D0%B5%D0%BC-dse"/>
+   <updated>2022-11-18T00:00:00+02:00</updated>
+   <id>http://localhost:4000/2022/11/18/Driver-Signature-Enforcement-или-исследуем-DSE</id>
+   <content type="html">&lt;p&gt;&lt;img src=&quot;https://telegra.ph/file/4e9862e1da916ff8cbcbe.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Хм.
+Допустим, мы должны убедиться, что у какого-либо драйвера есть собственная цифровая подпись. Так и еще чтоб она была валидной! Логично, что для этого нужен какой-либо механизм, совершающий подобные проверки. Ну, что же, да, таков есть в Windows и ни для кого это не секрет.&lt;/p&gt;
+
+&lt;p&gt;Садитесь удобнее, сегодня мы попытаемся понять, где обитает DSE и почему он причиняет боль многим любителям говна в режиме ядра.&lt;/p&gt;
+
+&lt;h2 id=&quot;что-такое-dse&quot;&gt;Что такое DSE?&lt;/h2&gt;
+
+&lt;p&gt;DSE - аббревиатура от словосочетания Driver Signature Enforcement. На самом деле это весьма комплексный механизм Code Integrity, он существует для “защиты” от неподписанных компонентов ядра, следовательно предполагает, что каждый драйвер устройства (или иной другой системный файл, выгружаемый в адресное пространство ядра) должен иметь собственную цифровую подпись. В противном случае, система просто откажется грузить этот компонент.
+Стоит на всякий случай сказать, что изменение системных файлов убивает подпись, поэтому, мои маленькие любители подрочить в ядре, это не прокатит и система скажет, что такой файл не загрузит! Так что да, эта технология существует по большому счету для защиты от вредоносов, работающих на уровне ядра. И, в принципе, он справляется вполне себе неплохо!&lt;/p&gt;
+
+&lt;p&gt;DSE включен по стандарту, но пользователям (только из под админа, конечно же) предоставляется возможность выключить на время проверку подписей (или включить Test Signing Mode, позволяющий загружать самоподписанные драйвера), например, через bcdedit. Правда, это чаще всего нужно только для разработчиков драйверов, когда они тестируют свои наработки.&lt;/p&gt;
+
+&lt;p&gt;С понятием DSE мы вроде разобрались, перейдем к теперь к его инициализации.&lt;/p&gt;
+
+&lt;h2 id=&quot;инициализация-driver-signature-enforcement-и-code-integrity&quot;&gt;Инициализация Driver Signature Enforcement и Code Integrity&lt;/h2&gt;
+
+&lt;p&gt;DSE является компонентом ядра, а значит, надо искать примерно на этом уровне или чуточку ниже.&lt;/p&gt;
+
+&lt;p&gt;DSE берет свое начало с фазы “ранней загрузки” системы - когда свое дело закончили загрузчики (в данном случае - winload.exe/winload.efi). Это дело выгружается с основными драйверами системы. Нужный нам покемон находится в CI.dll (CodeIntegrity). Если обратить внимание на то, что экспортирует данная DLL мы однозначно можем сказать, что нам нужна функция под именем &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt;:
+&lt;img src=&quot;https://telegra.ph/file/7fb3cd9c955cf7729785a.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Однако, давайте не спешить, мы зайдем немного с другого угла и чуточку уйдем от CI.dll.&lt;/p&gt;
+
+&lt;p&gt;Все же не менее важным для ОС, как ни странно, является ядро, а это значит, что упоминание CiInitialize должно быть и там.
+В действительности, так и есть, более того, эта функция также вызывается во время инициализации системы. &lt;em&gt;Барабанная дробь&lt;/em&gt;…&lt;/p&gt;
+
+&lt;p&gt;Давайте посмотрим на функцию из ntoskrnl.exe - &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SepInitializeCodeIntegrity&lt;/code&gt;.
+&lt;img src=&quot;https://telegra.ph/file/6903d2a8ee5d3114b8c9e.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;А теперь приведем её в более приличный (и правильный) вид. Заодно я оставлю её как “код”, надеюсь, так будет удобнее:&lt;/p&gt;
+
+&lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;NTSTATUS SepInitializeCodeIntegrity() {
+   unsigned int CiOptions;
+   _LIST_ENTRY *p_BootDriverListHead;
+   _LOADER_PARAMETER_EXTENSION *Ext;
+   _LOADER_PARAMETER_CI_EXTENSION *CodeIntegrityData;
+   char *LoadOptions;
+
+   CiOptions = 6;
+   memset(&amp;amp;CodeIntegrityCallbacks, 0, 0xC4); // nt!SeCiCallbacks
+
+   p_BootDriverListHead = 0;
+   SeCiCallbacks = 0xD0;
+   qword_140C1DAA8 = 0xA000008; // nt!SeCiCallbacks + 0xC8
+
+   if(KeLoaderBlock ) {
+      Ext = KeLoaderBlock-&amp;gt;Extension;
+       if(Ext) {
+           CodeIntegrityData = Ext-&amp;gt;CodeIntegrityData;
+           if(CodeIntegrityData)
+               CiOptions = CodeIntegrityData-&amp;gt;CodeIntegrityOptions;
+       }
+
+       // (KeLoaderBlock + 0xD8)
+       LoadOptions = KeLoaderBlock-&amp;gt;LoadOptions;
+       if(SepIsOptionPresent(LoadOptions) &amp;amp;&amp;amp; LoadOptions)
+           SeCiDebugOptions |= 1;
+       if(KeLoaderBlock)
+           p_BootDriverListHead = &amp;amp;KeLoaderBlock-&amp;gt;BootDriverListHead;
+   }
+
+   return CiInitialize(CiOptions, p_BootDriverListHead, &amp;amp;SeCiCallbacks, SeCiPrivateApis);
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Именно в этой функции мы получаем информацию о существовании &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt; впервые, правда, уже через само ядро. Думаю, стоит разобрать поближе несколько моментов.&lt;/p&gt;
+
+&lt;p&gt;И начну я пожалуй с &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeCiPrivateApis&lt;/code&gt;, так как они требуют меньше объяснений и о них можно сказать прямо сейчас. Из названия логично предположить, что &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeCiPrivateApis&lt;/code&gt; содержит в себе список некоторых функций, с которыми работает модуль Code Integrity. Данный список содержит в себе оффсеты на функции: &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;PsQueryProcessSignatureMitigationPolicy&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;VslHvciInterface&lt;/code&gt; (это оффсет на &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;VslCreateSecureAllocation&lt;/code&gt;), &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SepZwLockRegistryKey&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;PsQuerySectionSignatureInformation&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SepSetRuntimeUpdatableSigningLevel&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;RtlValidProcessProtection&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;MmGetImageFileSignatureInformation&lt;/code&gt; и &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SepGetSystemSigningLevel&lt;/code&gt;.
+Данные функции не будут разбираться в этой статье, однако, я покажу несколько из них.
+&lt;img src=&quot;https://telegra.ph/file/3c57bbca915d7293f7d72.png&quot; alt=&quot;&quot; /&gt;
+&lt;img src=&quot;https://telegra.ph/file/b45274c032ea9926fd1b6.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Назначение &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeCiCallbacks&lt;/code&gt; я разберу в следующем параграфе. Также, не выкидывайте из головы структуру &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;_LOADER_PARAMETER_CI_EXTENSIONS&lt;/code&gt;, с ней есть одна забавная особенность.&lt;/p&gt;
+
+&lt;p&gt;Кстати, забыл показать call stack. Да, функция и в правду вызывается во время инициализации:
+&lt;img src=&quot;https://telegra.ph/file/e4abbe662744d8cde2132.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;h2 id=&quot;от-ядра-к-модулю&quot;&gt;От ядра к модулю&lt;/h2&gt;
+
+&lt;p&gt;Хорошо, мы поняли, что за инициализацию DSE в ядре отвечает функция &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SepInitializeCodeIntegrity&lt;/code&gt;, данная функция срабатывает во время инициализации самой системы и она вызывает нужный нам &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt;. 
+Самое время глянуть на &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt;! Ииииииии…
+&lt;img src=&quot;https://telegra.ph/file/9c1b4d27a34a71d1aee9b.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Да, это очередной враппер над еще одной функцией - &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CipInitialize&lt;/code&gt;. Интересно, что тут мы имеем упоминание Microsoft WIL (Windows Implementation Library). Это нас не должно особо волновать, данные вещи нам не нужны и не мешают, но, решил просто это отметить.&lt;/p&gt;
+
+&lt;p&gt;Хорошо, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt; - это враппер. Значит, идем прямиком в &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CipInitialize&lt;/code&gt;! И, да, это она, именно она отвечает за инициализацию нашего DSE. Это весьма большая функция, поэтому придется разместить её на нескольких скринах. Надеюсь, вы не против.
+&lt;img src=&quot;https://telegra.ph/file/a2e2be4196b714a7a4dc8.png&quot; alt=&quot;&quot; /&gt;
+&lt;img src=&quot;https://telegra.ph/file/fa5d863955762c1677c12.png&quot; alt=&quot;&quot; /&gt;
+&lt;img src=&quot;https://telegra.ph/file/39ee3395136919466487d.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Отлично, мы нашли, где инициализируется DSE! Давайте разберем наиболее примечательные детали.
+&lt;img src=&quot;https://telegra.ph/file/f8d2a79350cd44cb79e01.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Данный отрывок проверяет, существует ли оффсет на &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;VslHvciInterface&lt;/code&gt;. Если да - заполняет таблицу &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;g_CiVslHvciInterface&lt;/code&gt;. Я так и не смог понять, точно ли это то, что должно быть в данной таблице (да-да, называйте меня дауном-долбоебом-уебком-etc), поэтому, не упомяну ничего здесь во избежание ошибок. Но, предполагаю, что загружает оно какую-то часть функций отсюда:
+&lt;img src=&quot;https://telegra.ph/file/0fe78ac2a60ef3ccfb6f2.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Скорее всего оно загружает все, начиная с &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;VslCreateSecureAllocation&lt;/code&gt; (присутствует в &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiPrivateApis&lt;/code&gt;) + &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;0x10&lt;/code&gt;.&lt;/p&gt;
+
+&lt;p&gt;Здесь при вызове HashpSelfTest CI.dll тестирует собственную подпись, что очевидно. В условии тестируются собственные “Root Table”.
+&lt;img src=&quot;https://telegra.ph/file/1aa55a84e5f35e98ded44.png&quot; alt=&quot;&quot; /&gt;
+&lt;img src=&quot;https://telegra.ph/file/20d7bb247df59109a70da.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;А вот здесь у нас есть немножечко примеси Xbox (&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;XciInitialize&lt;/code&gt; импортируется из &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;ext-ms-win-ci-xbox-l1-1-0&lt;/code&gt;), живите с этим.
+&lt;img src=&quot;https://telegra.ph/file/d193ed2b36bc07faed7c1.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;А вот и самое главное - таблица коллбеков! Именно функции этой таблицы и отвечают за проверку подписей, а значит, мы технически нашли, то, что нам нужно!
+&lt;img src=&quot;https://telegra.ph/file/820e3130699acad4b27c4.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Самое главное, что делает &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CipInitialize&lt;/code&gt; - заполняет таблицу &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiCallbacks&lt;/code&gt;, а &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiInitialize&lt;/code&gt; передает заполненную таблицу ядру. Теперь, мы поняли, как иницализируется механизм проверки подписей. Осталось понять, каким образом проверяются загружаемые системные модули.&lt;/p&gt;
+
+&lt;h2 id=&quot;мы-любим-только-проверенные-образы&quot;&gt;Мы любим только проверенные образы&lt;/h2&gt;
+
+&lt;p&gt;Когда необходимая таблица с указателями на функции заполнилась - система может начинать совершать проверку загружаемых образов в пространство ядра.&lt;/p&gt;
+
+&lt;p&gt;Опытным путем было найдено несколько функций, отвечающих за это. Например, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeValidateImageHeader&lt;/code&gt;:
+&lt;img src=&quot;https://telegra.ph/file/9799da23dd5d410bd4d46.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Здесь проводится проверка, существует ли &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeCiCallbacks&lt;/code&gt; (или &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiCallbacks&lt;/code&gt;, как я обозначал ранее) со смещением &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;0x20&lt;/code&gt; (&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiValidateImageHeader&lt;/code&gt;), если да - производим проверку, в противном случае возвращаем NTSTATUS равный &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;0xC0000428&lt;/code&gt; (&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;STATUS_INVALID_IMAGE_HASH&lt;/code&gt;). Call stack для &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeValidateImageHeader&lt;/code&gt; выглядит так:
+&lt;img src=&quot;https://telegra.ph/file/15d4b12d4eebb007309b3.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Т.е, путь до проверки заголовка образа проходит от загрузки (&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;MmLoadSystemImage&lt;/code&gt;) до самой валидации (&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeValidateImageHeader&lt;/code&gt; и &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiValidateImageHeader&lt;/code&gt;).&lt;/p&gt;
+
+&lt;p&gt;Это справедливо и для других функций, например для &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SeValidateImageData&lt;/code&gt; и &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;CiValidateImageData&lt;/code&gt;!&lt;/p&gt;
+
+&lt;h2 id=&quot;windbg-и-dse&quot;&gt;WinDBG и DSE&lt;/h2&gt;
+
+&lt;p&gt;Забавно, но стоит отметить, что WinDBG, если мы занимаемся отладкой ядра/бутменеджера/бутлоадера, сам отключает DSE, судя по всему это связано со структурой &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;_LOADER_PARAMETER_CI_EXTENSIONS&lt;/code&gt;:
+&lt;img src=&quot;https://telegra.ph/file/16d6ffa7b4779e041b155.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;h2 id=&quot;структура-_loader_parameter_ci_extensions&quot;&gt;Структура _LOADER_PARAMETER_CI_EXTENSIONS&lt;/h2&gt;
+
+&lt;p&gt;К сожалению, у меня она почему-то решила не загружаться (110% я криворукий долбоеб), поэтому вам придется поверить мне на слово, но обычно параметр CodeIntegrityOptions равен 6, однако, при подключенном WinDBG это поле скорее всего становится 0. Скорее всего это связано с тем, что настройки при отладке ядра изменяют это поле, а заодно вместе с ними и WinDBG. Если мы вспомним с чего мы начинали, то можем увидеть это же значение:&lt;/p&gt;
+
+&lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;CiOptions = 6;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;И, да, скорее всего это один из способов обхода механизма DSE.&lt;/p&gt;
+
+&lt;h2 id=&quot;выводы&quot;&gt;Выводы&lt;/h2&gt;
+
+&lt;p&gt;В данной статье я немного разобрал механизм инициализации Driver Signature Enforcement, а также немного рассказал, как он работает. Конечно, здесь непаханное поле экспериментов и можно еще что-то глянуть даже.&lt;/p&gt;
+
+&lt;p&gt;Как-то так, не скучайте, не болейте, кушайте хорошо. Водички побольше пейте, воооооот.&lt;/p&gt;
+</content>
+ </entry>
+ 
+ <entry>
+   <title>Как мы на Kaspersky в KSE охотились</title>
+   <link href="http://localhost:4000/2021/12/02/kaspersky-kse"/>
+   <updated>2021-12-02T00:00:00+02:00</updated>
+   <id>http://localhost:4000/2021/12/02/kaspersky-kse</id>
+   <content type="html">&lt;p&gt;Где-то примерно неделю назад один мой коллега приметил одну замечательную вещь: Kaspersky интересным образом протянул свои ручки к Kernel Shim Engine.&lt;/p&gt;
+
+&lt;p&gt;В итоге мы собрались где-то вчера разгребать и смотреть, что он там забыл. Также попытались распилить и отловить шим Касперского, но об этом чуть позже.&lt;/p&gt;
+
+&lt;h2 id=&quot;вводные&quot;&gt;Вводные&lt;/h2&gt;
+
+&lt;p&gt;Начнем с понимания, что это вообще за зверь такой - Kernel Shim Engine.
+Технически Kernel Shim Engine (далее KSE) предоставляет “обертки” для драйверов устройств, а также обеспечивает дополнительную поддержку и обработку ошибок драйверов устройств. У него есть своя специальная база данных, мы затронем её позже.&lt;/p&gt;
+
+&lt;p&gt;Также стоит поговорить о кое чем еще.&lt;/p&gt;
+
+&lt;h2 id=&quot;инициализация-шимов&quot;&gt;Инициализация шимов&lt;/h2&gt;
+
+&lt;p&gt;Если говорить в кратце и не вдаваться в подробности работы, то шимы инициализируются на этапе загрузки системы, где-то сразу после того, как инциализировался HAL (Hardware Abstraction Layer) и WMI (Windows Management Instrumentation) с ETW (Event Tracing for Windows). После прогрузки HAL, WMI и ETW вызывается функция &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KseInitialize()&lt;/code&gt;, а после нее &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KseRegisterShim()&lt;/code&gt;. Эти функции официально не документированы, но находятся в некоторых заголовочных файлах WDK.&lt;/p&gt;
+
+&lt;h2 id=&quot;инициализация-built-in-шимов-драйверов&quot;&gt;Инициализация “Built-in” шимов драйверов&lt;/h2&gt;
+
+&lt;p&gt;В конце инициализации HAL происходит инициализация шима &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;DriverScope&lt;/code&gt;, этот шим преоставляется по стандарту системой:
+&lt;img src=&quot;https://telegra.ph/file/6a7e823e4f6994c25239a.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Затем, во время инициализации WMI/ETW также инициализируется функция &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KseVersionLieInitialize()&lt;/code&gt;. Данная функция инициализирует шимы &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KmWin7VersionLie&lt;/code&gt;, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KmWin8VersionLie&lt;/code&gt; и &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KmWin81VersionLie&lt;/code&gt; (хоть тесты и производились на десятке, но подобный шим с версией “10” я не обнаружил):
+&lt;img src=&quot;https://telegra.ph/file/6696892d9103caf951ff6.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Потом вызывается функция &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KseSkipDriverUnloadInitialize()&lt;/code&gt;, которая инициализирует шим &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;SkipDriverUnload&lt;/code&gt;.&lt;/p&gt;
+
+&lt;h2 id=&quot;функции-касперского-в-ядре&quot;&gt;Функции Касперского в ядре&lt;/h2&gt;
+
+&lt;p&gt;Окей, вроде +- разобрались. Теперь, какие функции были найдены мной, затрагивающие шимы:&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://telegra.ph/file/7503d5cdb5fbbe607e2ea.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Доступ был только к функции к &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;KseKasperskyInitialize()&lt;/code&gt;:
+&lt;img src=&quot;https://telegra.ph/file/454425e15d9dc8fbc91b7.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Сперва мы решили посмотреть, как поведет себя Касперский при манипуляции с реестром, а конкретнее:&lt;/p&gt;
+
+&lt;ul&gt;
+  &lt;li&gt;&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;HKEY_LOCAL_MACHINE\System\CurrentControlSet\Policies\Microsoft\Compatibility&lt;/code&gt;
+    С ключами DisableDeviceFlags и DisableDriverShims (REG_DWORD), их значения равны единицы, очевидно по названиям ключей, что они делают при значении 0x01.&lt;/li&gt;
+  &lt;li&gt;&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;HKEY_LOCAL_MACHINE\System\CurrentControlSet\Control\Compatibility&lt;/code&gt;
+    С ключем DisableFlags (REG_DWORD) со значением 0x01 (отключает функциональность драйвера).&lt;/li&gt;
+&lt;/ul&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://telegra.ph/file/d28d92c33c10e020b0a13.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;&lt;img src=&quot;https://telegra.ph/file/7882dbc6a7958bb351b22.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;В нашем случае Касперский никак себя не повел, тем более он спокойно дал изменить значения регистров, т.е эти ключи реестра не мониторятся Касперским.&lt;/p&gt;
+
+&lt;h2 id=&quot;как-поломать-kse&quot;&gt;Как поломать KSE&lt;/h2&gt;
+
+&lt;p&gt;Можно сломать KSE двумя путями: мониторинг драйвера через Verifier и с помощью удаления drvmain.sdb.
+Мы вполне имеем право поставить Verifier на драйвер Касперского, ну или удалить сам drvmain.sdb, но скорее всего это вызовет BSOD.&lt;/p&gt;
+
+&lt;h2 id=&quot;drvmainsdb&quot;&gt;drvmain.sdb&lt;/h2&gt;
+
+&lt;p&gt;Мы все же решили для начала порыться в drvmain.sdb. Стоит сказать, что до мониторинга и удаления мы не дошли, а почему - вы поймете позже.&lt;/p&gt;
+
+&lt;p&gt;drvmain.sdb - стандартная база данных “легальных” драйверов и не только. Помимо драйверов, там также находится информация о шимах и других вещах.
+Этот файл находится в “%systemroot%/apppatch/”. Файлы с расширением sdb можно открыть, к примеру, через SDBExplorer.&lt;/p&gt;
+
+&lt;p&gt;Видим в drvmain вот такую картину:
+&lt;img src=&quot;https://telegra.ph/file/43166105e211864bb3a9d.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Да, список драйверов Касперского, ничего удивительного. Можно было бы ставить Verifier на klhk.sys и идти отлавливать шим Касперского, но не все так просто.&lt;/p&gt;
+
+&lt;h2 id=&quot;kshim-и-почему-все-печально-закончилось&quot;&gt;KSHIM и почему все печально закончилось&lt;/h2&gt;
+
+&lt;p&gt;В drvmain, как и упоминалось выше, есть не только перечисление драйверов, а также некоторые шимы.
+Представляются они в виде структуры KSHIM, которая по сути является структурой KSE_SHIM, только слегка измененной:&lt;/p&gt;
+
+&lt;div class=&quot;language-plaintext highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;typedef struct _KSE_SHIM {
+  _In_ ULONG Size;
+  _In_ PGUID ShimGuid;
+  _In_ PWCHAR ShimName;
+  _Out_ PVOID KseCallbackRoutines;
+  _Inopt_ PVOID ShimmedDriverTargetedNotification;
+  _Inopt_ PVOID ShimmedDriverUntargetedNotification;
+  _In_ PVOID HookCollectionsArray;
+} KSE_SHIM, *PKSE_SHIM;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Вот как выглядит KSHIM Касперского:
+&lt;img src=&quot;https://telegra.ph/file/6de97f18ed595c54a1a32.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Заметьте, что поле MODULE несет значение “NT kernel component”. А теперь можем посмотреть на ndis шимы:
+&lt;img src=&quot;https://telegra.ph/file/d9be19f43a929c8b93057.png&quot; alt=&quot;&quot; /&gt;&lt;/p&gt;
+
+&lt;p&gt;Да, тут поле MODULE со значением “ndis”. Думаю, можно догадаться, в чем проблема.&lt;/p&gt;
+
+&lt;p&gt;Ага, это значит, что шим Касперского существует в пространстве самого ядра системы. А это значит, что кроме как накидывая Verifier на ядро мы отследить шим Касперского не сможем. Вот, только если накидывать его на ядро, сломается не только Касперский, но и сама система. Прикольно, правда?&lt;/p&gt;
+
+&lt;h2 id=&quot;возможный-путь-отлова-шима-касперского&quot;&gt;Возможный путь отлова шима Касперского&lt;/h2&gt;
+
+&lt;p&gt;В мою голову лезет только анализ дампа системы. Т.е мы должны завершить систему аварийно, при этом сгенерировав дамп системы, где был запущен Касперский. Команда “.crash” (если не ошибаюсь) из windbg вполне решит эту проблему. Я, правда, не уверен, что мы сможем вытащить что-то дельное, но попытка не пытка, как говорится.&lt;/p&gt;
+
+&lt;h2 id=&quot;послесловие-и-догадки&quot;&gt;Послесловие и догадки&lt;/h2&gt;
+
+&lt;p&gt;Теоретически, &lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;_KSE_SHIM&lt;/code&gt; - пользовательский ввод. Есть смысл посидеть над драйвером ndis.sys (сама структура оттуда). Однако, стучать туда через непривелегированного пользователя мы не сможем, но вполне вероятно, что до туда сможет достать TrustedInstaller.&lt;/p&gt;
+</content>
+ </entry>
+ 
+
+</feed>

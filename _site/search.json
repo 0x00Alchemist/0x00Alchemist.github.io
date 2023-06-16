@@ -1,0 +1,21 @@
+[
+  
+    {
+      "title"    : "Drowning In The Kernel - Driver Signature Enforcement!",
+      "description" : "Исследуем инициализацию механизма проверки подписи драйверов в Windows",
+      "category" : "",
+      "tags"     : "Windows, DSE",
+      "url"      : "/2022/11/18/driver-signature-enforcement-%D0%B8%D0%BB%D0%B8-%D0%B8%D1%81%D1%81%D0%BB%D0%B5%D0%B4%D1%83%D0%B5%D0%BC-dse",
+      "date"     : "2022-11-18 00:00:00 +0200"
+    } ,
+  
+    {
+      "title"    : "Как мы на Kaspersky в KSE охотились",
+      "description" : "Рассматриваем как Kaspersky укрепились в KSE",
+      "category" : "",
+      "tags"     : "Windows, AV, KSE",
+      "url"      : "/2021/12/02/kaspersky-kse",
+      "date"     : "2021-12-02 00:00:00 +0200"
+    } 
+  
+]
